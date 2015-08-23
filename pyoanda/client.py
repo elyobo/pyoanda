@@ -1,5 +1,6 @@
 import json
 import requests
+import socket
 
 from io import BytesIO
 from time import sleep, time
@@ -163,7 +164,8 @@ class Client(object):
             if stream:
                 call["timeout"] = 20
                 response = self._Client__call_stream(**call)
-                return StreamedResponse(client=self, response=response)
+                reconnect = lambda: self._Client__call_stream(**call)
+                return StreamedResponse(response, reconnect)
             else:
                 return self._Client__call(**call)
         except RequestException:
@@ -708,28 +710,67 @@ class StreamedResponse(object):
        * No data has been received (no events, no heartbeats) from the
          events stream for more than 20 seconds.
 
-       Also supports the recommended exponential backoff in case of
+       Also supports reconnecting if Oanda resets the connection. The
+       reconnection obeys the recommended exponential backoff in case of
        reconnection errors and handling the HTTP 429 response given if
        the reconnection limit is exceeded.
-
-       Also supports reconnecting if Oanda resets the connection.
 
        See more:
        http://developer.oanda.com/rest-live/streaming/#connections
     """
-    def __init__(self, client, response):
-        self._client = client
+    def __init__(self, response, reconnect):
+        """Set the contained response and reconnection method.
+
+            Parameters
+            ----------
+            response : requests.Response
+                The current streamed response.
+            reconnect : callable
+                The method to call to restore the connection; when it
+                is called it must return the new connection.
+        """
         self._response = response
+        self._reconnect = reconnect
+        self._last_connection_time = 0.0
+        self.base_delay = 1.0
         pass
+
+    def _restore_connection(self):
+        self._response = None
+        delay = self.base_delay
+        while not self._response:
+            # Backoff as per Oanda recommendations
+            gap = time() - self._last_connection_time
+            if gap < delay:
+                sleep(delay - gap)
+
+            try:
+                self._response = self._reconnect()
+                self._last_connection_time = time()
+            except socket.error as e:
+                delay *= 2
+            except BadRequest as e:
+                # HTTP 429 Too Many Requests, rate limited by Oanda
+                if e.errno is not 429:
+                    raise
+                delay *= 2
+
+    def iter_lines(self, chunk_size=512, decode_unicode=None, delimiter=None):
+        loop = True
+        while loop:
+            loop = False
+            try:
+                lines = self._response.iter_lines(chunk_size, decode_unicode,
+                                                  delimiter)
+                for line in lines:
+                    yield line
+            except socket.error as e:
+                log.warn('Encountered socket error %r' % e)
+                self._restore_connection()
+                loop = True
 
     def close(self):
         self._response.close()
-
-    def iter_content(self, chunk_size=1, decode_unicode=False):
-        return self._response.iter_content(chunk_size, decode_unicode)
-
-    def iter_lines(self, chunk_size=512, decode_unicode=None, delimiter=None):
-        return self._response.iter_lines(chunk_size, decode_unicode, delimiter)
 
     def json(self, **kwargs):
         return self._response.json(**kwargs)
