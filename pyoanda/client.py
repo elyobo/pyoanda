@@ -52,7 +52,13 @@ class Client(object):
         except AssertionError:
             return False
 
-    def __get_response(self, uri, params=None, method="get", stream=False):
+    def __get_response(
+            self,
+            uri,
+            params=None,
+            method="get",
+            stream=False,
+            request_args=None):
         """Creates a response object with the given params and option
 
             Parameters
@@ -67,6 +73,9 @@ class Client(object):
                 The HTTP method to use.
             stream : bool
                 Whether to stream the response.
+            request_args : dict
+                Additional arguments to pass when making the connection,
+                e.g. timeout.
 
             Returns a requests.Response object.
         """
@@ -81,15 +90,14 @@ class Client(object):
         if params:
             params = {k: v for k, v in params.items() if v is not None}
 
-        kwargs = {
-            "url": uri,
-            "verify": True,
-            "stream": stream
-        }
+        args = request_args or {}
+        args["url"] =  uri
+        args["verify"] = True
+        args["stream"] = stream
 
-        kwargs["params" if method == "get" else "data"] = params
+        args["params" if method == "get" else "data"] = params
 
-        return getattr(self.session, method)(**kwargs)
+        return getattr(self.session, method)(**args)
 
     def __call(self, uri, params=None, method="get"):
         """Only returns the response, nor the status_code
@@ -108,11 +116,12 @@ class Client(object):
         else:
             return rjson
 
-    def __call_stream(self, uri, params=None, method="get"):
+    def __call_stream(self, uri, params=None, method="get", timeout=None):
         """Returns an stream response
         """
         try:
-            resp = self.__get_response(uri, params, method, True)
+            args = {"timeout": timeout} if timeout else {}
+            resp = self.__get_response(uri, params, method, True, args)
             assert resp.ok
         except AssertionError:
             raise BadRequest(resp.status_code)
@@ -152,7 +161,9 @@ class Client(object):
 
         try:
             if stream:
-                return self._Client__call_stream(**call)
+                call["timeout"] = 20
+                response = self._Client__call_stream(**call)
+                return StreamedResponse(client=self, response=response)
             else:
                 return self._Client__call(**call)
         except RequestException:
@@ -682,3 +693,46 @@ class Client(object):
             return False
         except AssertionError:
             return False
+
+
+class StreamedResponse(object):
+    """An extended wrapper for requests.Response for streamed responses.
+
+       The main function of this is to provide connection error handling
+       as per the Oanda's guidelines.
+
+       Disconnect and reconnect if
+
+       * No data has been received (no ticks, no heartbeats) from the
+         rates stream for more than 10 seconds.
+       * No data has been received (no events, no heartbeats) from the
+         events stream for more than 20 seconds.
+
+       Also supports the recommended exponential backoff in case of
+       reconnection errors and handling the HTTP 429 response given if
+       the reconnection limit is exceeded.
+
+       Also supports reconnecting if Oanda resets the connection.
+
+       See more:
+       http://developer.oanda.com/rest-live/streaming/#connections
+    """
+    def __init__(self, client, response):
+        self._client = client
+        self._response = response
+        pass
+
+    def close(self):
+        self._response.close()
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        return self._response.iter_content(chunk_size, decode_unicode)
+
+    def iter_lines(self, chunk_size=512, decode_unicode=None, delimiter=None):
+        return self._response.iter_lines(chunk_size, decode_unicode, delimiter)
+
+    def json(self, **kwargs):
+        return self._response.json(**kwargs)
+
+    def raise_for_status(self):
+        return self._response.raise_for_status()
